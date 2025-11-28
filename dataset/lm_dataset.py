@@ -24,6 +24,7 @@ class PretrainDataset(Dataset):
         samples = []
         with open(path, 'r', encoding='utf-8') as f:
             for line_num, line in enumerate(f, 1):
+                # 假设每行是一个JSON对象，包含'text'字段
                 data = json.loads(line.strip())
                 samples.append(data)
         return samples
@@ -32,9 +33,12 @@ class PretrainDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, index):
+        # 获取样本
         sample = self.samples[index]
 
         # 构建输入文本
+        # 对文本进行tokenizer编码
+        
         encoding = self.tokenizer(
             str(sample['text']),
             max_length=self.max_length,
@@ -42,12 +46,18 @@ class PretrainDataset(Dataset):
             truncation=True,
             return_tensors='pt'
         )
+        # 将输入ID张量化并去掉批次维度
+        # input_ids shape: (seq_len,)
         input_ids = encoding.input_ids.squeeze()
+        # 计算 loss mask，非pad位置为1，pad位置为0，pad 的地方不计算 loss
         loss_mask = (input_ids != self.tokenizer.pad_token_id)
-
+        # 自回归任务，构建X和Y
         X = torch.tensor(input_ids[:-1], dtype=torch.long)
         Y = torch.tensor(input_ids[1:], dtype=torch.long)
+        # 对齐预测位置
+        # 由于Y是input_ids右移一位，所以loss_mask也需要右移一位
         loss_mask = torch.tensor(loss_mask[1:], dtype=torch.long)
+        # 返回数据
         return X, Y, loss_mask
 
 
@@ -57,6 +67,9 @@ class SFTDataset(Dataset):
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.samples = self.load_data(jsonl_path)
+        # 将特定的控制字符和文本转换为模型能够理解的整数列表
+        # 这些ID用于识别对话的开始和结束
+        # add_special_tokens=False 确保只获取指定文本的ID，而不添加额外的特殊标记
         self.bos_id = tokenizer(f'{tokenizer.bos_token}assistant', add_special_tokens=False).input_ids
         self.eos_id = tokenizer(f'{tokenizer.eos_token}', add_special_tokens=False).input_ids
 
@@ -64,6 +77,7 @@ class SFTDataset(Dataset):
         return len(self.samples)
 
     def load_data(self, path):
+        # 类似于 PretrainDataset 的 load_data 方法
         samples = []
         with open(path, 'r', encoding='utf-8') as f:
             for line_num, line in enumerate(f, 1):
@@ -72,8 +86,16 @@ class SFTDataset(Dataset):
         return samples
 
     def _create_chat_prompt(self, cs):
+        # 构建符合ChatML格式的对话
+        # cs 代表 conversations 列表
+
+        # 复制对话列表，避免修改原始数据
         messages = cs.copy()
+        # tools 变量用于存储系统消息中的工具信息（如果有的话）
+        # 如果第一个消息的 role 是 "system" 且包含"functions"字段，则提取该字段作为tools
         tools = cs[0]["functions"] if (cs and cs[0]["role"] == "system" and cs[0].get("functions")) else None
+        # 构建符合ChatML格式的对话
+        # 返回时不进行tokenize，并且不添加生成提示符
         return self.tokenizer.apply_chat_template(
             messages,
             tokenize=False,
@@ -82,18 +104,32 @@ class SFTDataset(Dataset):
         )
 
     def _generate_loss_mask(self, input_ids):
+        # 构建动态损失掩码
+        # 只有assistant回复的部分才计算loss
+
         loss_mask = [0] * len(input_ids)
         i = 0
         while i < len(input_ids):
+            # 遍历查找assistant回复的开始位置
             if input_ids[i:i + len(self.bos_id)] == self.bos_id:
+                # 找到assistant回复的起始位置
                 start = i + len(self.bos_id)
                 end = start
+                # 遍历查找assistant回复的结束位置
                 while end < len(input_ids):
+                    # 找到回复的结束位置
                     if input_ids[end:end + len(self.eos_id)] == self.eos_id:
                         break
                     end += 1
+                # 标记loss_mask中对应assistant回复的部分为1
+                # 从start+1开始，因为第一个token是assistant的标识符，不计算loss
+                # 标记到end加上eos_id的长度，确保包含结束标识符
+                # 标记时确保不超过max_length
+                # 注意标识符问题，开始标识符不加入 loss 是因为它只是一个标记，是模型输入的一部分，模型不需要生成这部分
+                # 而结束标识符是模型必须学会生成的内容的一部分
                 for j in range(start + 1, min(end + len(self.eos_id) + 1, self.max_length)):
                     loss_mask[j] = 1
+                # 更新i位置，继续查找下一个assistant回复
                 i = end + len(self.eos_id) if end < len(input_ids) else len(input_ids)
             else:
                 i += 1
@@ -103,13 +139,18 @@ class SFTDataset(Dataset):
         sample = self.samples[index]
         # 构建对话提示
         prompt = self._create_chat_prompt(sample['conversations'])
+        # 对提示进行tokenizer编码，确保长度不超过max_length
         input_ids = self.tokenizer(prompt).input_ids[:self.max_length]
+        # 如果长度不足max_length，则进行padding
         input_ids += [self.tokenizer.pad_token_id] * (self.max_length - len(input_ids))
 
         # 生成动态损失掩码
+        # 只有assistant回复的部分才计算loss
         loss_mask = self._generate_loss_mask(input_ids)
 
         # 构建训练数据
+        # 输入是input_ids的前n-1个token
+        # 目标是input_ids的第2到第n个token
         X = torch.tensor(input_ids[:-1], dtype=torch.long)
         Y = torch.tensor(input_ids[1:], dtype=torch.long)
         loss_mask = torch.tensor(loss_mask[1:], dtype=torch.long)  # 对齐预测位置
@@ -132,6 +173,7 @@ class DPODataset(Dataset):
         self.padding = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
         self.bos_id = tokenizer(f'{tokenizer.bos_token}assistant', add_special_tokens=False).input_ids
         self.eos_id = tokenizer(f'{tokenizer.eos_token}', add_special_tokens=False).input_ids
+        # 读取JSONL文件
         with open(file_path, 'r', encoding='utf-8') as f:
             self.data = []
             for line in f:

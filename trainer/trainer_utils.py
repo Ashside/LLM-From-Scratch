@@ -22,6 +22,7 @@ def Logger(content):
 
 
 def get_lr(current_step, total_steps, lr):
+    # 余弦退火学习率调度
     return lr / 10 + 0.5 * lr * (1 + math.cos(math.pi * current_step / total_steps))
 
 

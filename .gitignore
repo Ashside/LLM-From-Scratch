@@ -2,3 +2,14 @@ model/__pycache__
 out
 website/
 docs-minimind/
+.vscode/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.idea/
+.DS_Store
+env/
+.venv/
+# Large dataset files
+*.jsonl

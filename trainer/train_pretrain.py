@@ -21,39 +21,60 @@ warnings.filterwarnings('ignore')
 
 
 def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
+    # reduction ='none'，不进行聚合，不计算平均或者求和
+    # 保留每个位置的loss，后续手动mask
     loss_fct = nn.CrossEntropyLoss(reduction='none')
     start_time = time.time()
+    # loader 是 DataLoader 对象
+    # 遍历数据集
     for step, (X, Y, loss_mask) in enumerate(loader, start=start_step + 1):
+        # 将数据移动到同一设备
         X = X.to(args.device)
         Y = Y.to(args.device)
+        # 将损失掩码移动到同一设备
         loss_mask = loss_mask.to(args.device)
+        # 计算当前学习率
         lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
+        # 动态调整学习率
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
 
+        # 使用混合精度上下文
         with autocast_ctx:
+            # 前向传播
             res = model(X)
+            # 计算损失
+            # loss_fct reduction='none'，不进行聚合，不计算平均或者求和，保留每个位置的loss，后续手动mask
             loss = loss_fct(
                 res.logits.view(-1, res.logits.size(-1)),
                 Y.view(-1)
             ).view(Y.size())
 
+            # 平均有效位置的loss
+            # loss_mask.sum() 计算非pad位置的数量
+            # loss * loss_mask 只保留非pad位置的loss
             loss = (loss * loss_mask).sum() / loss_mask.sum()
+            # 如果是MoE模型，累加辅助损失
             loss += res.aux_loss
+            # 梯度累积，除以累积步数
             loss = loss / args.accumulation_steps
-
+        # 使用梯度缩放器进行反向传播
         scaler.scale(loss).backward()
 
+        # 梯度累积步骤结束，执行优化器步骤
         if (step + 1) % args.accumulation_steps == 0:
+            # 取消梯度缩放，以便进行梯度裁剪
+            # clip_grad_norm_需要未缩放的梯度
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-
+            # 执行优化器步骤
             scaler.step(optimizer)
             scaler.update()
-
+            # 清零梯度
             optimizer.zero_grad(set_to_none=True)
+            # 清理显存
             torch.cuda.empty_cache()
-
+        # 日志记录和模型保存
         if step % args.log_interval == 0 or step == iters - 1:
             spend_time = time.time() - start_time
             current_loss = loss.item() * args.accumulation_steps

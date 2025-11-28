@@ -114,11 +114,22 @@ def precompute_freqs_cis(dim: int, end: int = int(32 * 1024), rope_base: float =
             rope_scaling.get("beta_fast", 4.0), rope_scaling.get("beta_slow", 1.0)
         )
         if end / orig_max > 1.0:
+            # 计算出需要调整的频率维度
+            # next函数会返回第一个满足条件的索引值i，即2π / freqs[i] > orig_max 
+            # 这里选出了波长超过orig_max的位置，这意味着这些维度对位置信息非常敏感
+            # 需要进行较强的缩放，而其他维度则保持不变
+            # 如果没有满足条件的索引，则返回dim // 2
             corr_dim = next((i for i in range(dim // 2) if 2 * math.pi / freqs[i] > orig_max), dim // 2)
+            # 生成一个从0到1的斜坡向量
             power = torch.arange(0, dim // 2, device=freqs.device).float() / max(dim // 2 - 1, 1)
+            # 利用 power 生成一个从 beta_slow 到 beta_fast 的线性插值
             beta = beta_slow + (beta_fast - beta_slow) * power
             # λ = (β·α - β + 1)/(β·α) YaRN标准公式
+            # where函数根据corr_dim对scale进行条件赋值
+            # 对于dim > corr_dim的维度，是低频部分，应用线性插值 1/ factor
+            # 对于dim <= corr_dim的维度，是高频部分，应用YaRN公式 (β·α - β + 1)/(β·α)
             scale = torch.where(torch.arange(dim // 2, device=freqs.device) < corr_dim, (beta * factor - beta + 1) / (beta * factor), 1.0 / factor)
+            # 应用缩放因子
             freqs = freqs * scale
 
     t = torch.arange(end, device=freqs.device)
@@ -136,13 +147,17 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     k_embed = (k * cos.unsqueeze(unsqueeze_dim)) + (rotate_half(k) * sin.unsqueeze(unsqueeze_dim))
     return q_embed, k_embed
 
-
+# 是实现GQA的关键函数
+# 为了减少显存占用和加速推理，通常让多个query头共享同一组key和value
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
+    # 将 K 和 V 的头在维度上进行复制扩展（repeat），使其数量与 Q 头一致。
     """torch.repeat_interleave(x, dim=2, repeats=n_rep)"""
     bs, slen, num_key_value_heads, head_dim = x.shape
     if n_rep == 1:
         return x
     return (
+        # e.g., (bs, slen, num_key_value_heads, head_dim) -> (bs, slen, num_key_value_heads, n_rep, head_dim)  
+        # 然后再reshape成 (bs, slen, num_key_value_heads * n_rep, head_dim)
         x[:, :, :, None, :].expand(bs, slen, num_key_value_heads, n_rep, head_dim).reshape(bs, slen, num_key_value_heads * n_rep, head_dim)
     )
 
@@ -154,12 +169,22 @@ class Attention(nn.Module):
         assert args.num_attention_heads % self.num_key_value_heads == 0
         self.n_local_heads = args.num_attention_heads
         self.n_local_kv_heads = self.num_key_value_heads
+        # 计算每个query头对应的key/value头的重复次数
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
         self.head_dim = args.hidden_size // args.num_attention_heads
+        # 定义线性投影层
+        # 注意如果使用多头注意力机制，hidden_size通常是head_dim * num_attention_heads
+        # 因此这里的q_proj会将hidden_size映射到num_attention_heads * head_dim，即保持维度不变
+        # k_proj和v_proj则映射到num_key_value_heads * head_dim，可能会减少维度
         self.q_proj = nn.Linear(args.hidden_size, args.num_attention_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(args.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(args.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
+        # 输出投影层
+        # 将多头注意力的输出重新映射回hidden_size维度
         self.o_proj = nn.Linear(args.num_attention_heads * self.head_dim, args.hidden_size, bias=False)
+        # dropout层
+        # attn_dropout用于注意力权重的dropout
+        # resid_dropout用于输出的dropout
         self.attn_dropout = nn.Dropout(args.dropout)
         self.resid_dropout = nn.Dropout(args.dropout)
         self.dropout = args.dropout
@@ -173,22 +198,31 @@ class Attention(nn.Module):
                 use_cache=False,
                 attention_mask: Optional[torch.Tensor] = None):
         bsz, seq_len, _ = x.shape
+        # 投影到q、k、v
         xq, xk, xv = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+        # 重塑形状以适应多头注意力机制
         xq = xq.view(bsz, seq_len, self.n_local_heads, self.head_dim)
         xk = xk.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
 
+        # 应用RoPE位置编码
         cos, sin = position_embeddings
+        # 截取对应长度的cos和sin
         xq, xk = apply_rotary_pos_emb(xq, xk, cos[:seq_len], sin[:seq_len])
 
         # kv_cache实现
         if past_key_value is not None:
+            # 拼接过去的key和value
             xk = torch.cat([past_key_value[0], xk], dim=1)
             xv = torch.cat([past_key_value[1], xv], dim=1)
+        # 更新past_key_value，下次调用时使用
         past_kv = (xk, xv) if use_cache else None
 
         xq, xk, xv = (
             xq.transpose(1, 2),
+            # 为了实现GQA，这里需要重复key和value头
+            # 由于xk和xv的形状是(bsz, seq_len, num_key_value_heads, head_dim)
+            # 这里需要transpose到(bsz, num_key_value_heads, seq_len, head_dim)
             repeat_kv(xk, self.n_rep).transpose(1, 2),
             repeat_kv(xv, self.n_rep).transpose(1, 2)
         )
@@ -197,7 +231,13 @@ class Attention(nn.Module):
             if attention_mask is None or torch.all(attention_mask == 1):
                 attn_mask, is_causal = None, True
             else:
+                # 因果掩码
+                # 上三角不含对角线部分设为-inf，表示这些位置不可见
                 causal_mask = torch.triu(torch.full((seq_len, seq_len), float("-inf"), device=xq.device), diagonal=1)
+                # 扩展注意力掩码以匹配批次大小和头数
+                # attention_mask的形状为 (batch_size, seq_len)
+                # 通过unsqueeze扩展维度以适应广播机制
+                # 最终形状变为 (batch_size, 1, 1, seq_len)
                 extended_mask = (1.0 - attention_mask.unsqueeze(1).unsqueeze(2)) * float("-inf")
                 attn_mask, is_causal = causal_mask.unsqueeze(0) + extended_mask, False
             
@@ -219,8 +259,10 @@ class Attention(nn.Module):
             scores = self.attn_dropout(scores)
             output = scores @ xv
 
+        # 重新调整输出形状
         output = output.transpose(1, 2).reshape(bsz, seq_len, -1)
         output = self.resid_dropout(self.o_proj(output))
+        # 返回输出和更新后的past_key_value
         return output, past_kv
 
 
@@ -249,7 +291,7 @@ class MoEGate(nn.Module):
 
         self.scoring_func = config.scoring_func
         self.alpha = config.aux_loss_alpha
-        self.seq_aux = config.seq_aux
+        self.seq_aux = config.seq_aux # 是否在序列级别上计算辅助损失
 
         self.norm_topk_prob = config.norm_topk_prob
         self.gating_dim = config.hidden_size
@@ -257,39 +299,70 @@ class MoEGate(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
+        # 使用kaiming初始化
         init.kaiming_uniform_(self.weight, a=math.sqrt(5))
 
     def forward(self, hidden_states):
         bsz, seq_len, h = hidden_states.shape
+        # 展平为二维张量，形状为 (bsz * seq_len, h)
         hidden_states = hidden_states.view(-1, h)
+        # 将 hidden_states 与权重矩阵相乘，得到 logits
+        # 形状为 (bsz * seq_len, n_routed_experts)
         logits = F.linear(hidden_states, self.weight, None)
+        # 使用softmax函数计算专家选择的概率分布
         if self.scoring_func == 'softmax':
             scores = logits.softmax(dim=-1)
         else:
             raise NotImplementedError(f'insupportable scoring function for MoE gating: {self.scoring_func}')
 
+        # 提取top-k专家的索引和权重
+        # topk_weight: (bsz * seq_len, top_k)
+        # topk_idx: (bsz * seq_len, top_k)
         topk_weight, topk_idx = torch.topk(scores, k=self.top_k, dim=-1, sorted=False)
 
+        # 由于剔除了非top-k专家的概率，需要对top-k概率进行归一化
         if self.top_k > 1 and self.norm_topk_prob:
             denominator = topk_weight.sum(dim=-1, keepdim=True) + 1e-20
             topk_weight = topk_weight / denominator
 
+        # 计算辅助损失以促进专家均衡使用
         if self.training and self.alpha > 0.0:
+            # 计算辅助损失以促进专家均衡使用
+
+            # 将之前的 scores 和 topk 保存为 aux 
             scores_for_aux = scores
             aux_topk = self.top_k
+            # 展平 topk_idx
             topk_idx_for_aux_loss = topk_idx.view(bsz, -1)
             if self.seq_aux:
+                # 如果需要在序列级别上计算辅助损失
+                # 将 scores_for_aux 重塑为 (bsz, seq_len, n_routed_experts)
                 scores_for_seq_aux = scores_for_aux.view(bsz, seq_len, -1)
+                # 计算每个专家被选择的次数
+                # ce: (bsz, n_routed_experts)
                 ce = torch.zeros(bsz, self.n_routed_experts, device=hidden_states.device)
+                # 使用 scatter_add_ 累加每个专家被选择的次数
+                # 原理是将 topk_idx_for_aux_loss 中的索引位置对应的 ce 元素加 1 
+                # 最终 ce 中存储了每个专家被选择的总次数
                 ce.scatter_add_(1, topk_idx_for_aux_loss,
                                 torch.ones(bsz, seq_len * aux_topk, device=hidden_states.device)).div_(
                     seq_len * aux_topk / self.n_routed_experts)
+                # 计算辅助损失
+                # 使用选中次数乘以对应的概率，再求和和均值
+                # 这样可以鼓励模型均衡地选择各个专家
                 aux_loss = (ce * scores_for_seq_aux.mean(dim=1)).sum(dim=1).mean() * self.alpha
             else:
+                # 如果在token级别上计算辅助损失
+                # 创建一个 one-hot 编码的掩码，形状为 (bsz * seq_len * topk, n_routed_experts)
                 mask_ce = F.one_hot(topk_idx_for_aux_loss.view(-1), num_classes=self.n_routed_experts)
+                # 计算每个专家被选择的次数
+                # ce: (n_routed_experts,)
                 ce = mask_ce.float().mean(0)
+                # 计算每个专家被选择的频率
                 Pi = scores_for_aux.mean(0)
+                # 计算辅助损失
                 fi = ce * self.n_routed_experts
+                # 最终的辅助损失是选择频率与概率的加权和
                 aux_loss = (Pi * fi).sum() * self.alpha
         else:
             aux_loss = 0
@@ -312,25 +385,43 @@ class MOEFeedForward(nn.Module):
             ])
 
     def forward(self, x):
-        identity = x
+        identity = x # 残差连接中使用
         orig_shape = x.shape
         bsz, seq_len, _ = x.shape
         # 使用门控机制选择专家
         topk_idx, topk_weight, aux_loss = self.gate(x)
+        # topk_idx: [bz * sqlen, topk]
+
+        # 将 x 展平后并行处理
+        # [bz * sqlen, hidden_size]
         x = x.view(-1, x.shape[-1])
+        # 对应将idx展平，[bz * sqlen * topk]
         flat_topk_idx = topk_idx.view(-1)
         if self.training:
+            # 将每个 token 复制 topk 次，分别送入不同的专家
+            # x: [(bz * sqlen) * topk, hidden_size]
             x = x.repeat_interleave(self.config.num_experts_per_tok, dim=0)
+            # 用于收集结果
+            # y: [(bz * sqlen) * topk, hidden_size]
             y = torch.empty_like(x, dtype=torch.float16)
+            # 遍历每个专家，分别处理分配给其的 token
             for i, expert in enumerate(self.experts):
+                #  通过 flat_topk_idx == 1 构建索引
                 y[flat_topk_idx == i] = expert(x[flat_topk_idx == i]).to(y.dtype)  # 确保类型一致
+            # 恢复维度
+            # 根据top_k 权重加权平均
+            # y: [bz * sqlen, topk]
             y = (y.view(*topk_weight.shape, -1) * topk_weight.unsqueeze(-1)).sum(dim=1)
             y = y.view(*orig_shape)
         else:
+            # 如果是推理模式
+            # topk_weight 先展平，再按照
             y = self.moe_infer(x, flat_topk_idx, topk_weight.view(-1, 1)).view(*orig_shape)
+        # 如果有共享专家，加上共享专家的输出
         if self.config.n_shared_experts > 0:
             for expert in self.shared_experts:
                 y = y + expert(identity)
+        # 保存门控模块的LOSS
         self.aux_loss = aux_loss
         return y
 
@@ -445,7 +536,9 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
         self.config = config or MiniMindConfig()
         super().__init__(self.config)
         self.model = MiniMindModel(self.config)
+        # 用于将隐藏状态映射到词汇表大小的线性层，以生成预测的logits
         self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
+        # 强制输入和输出嵌入权重共享，不仅节省显存，还能提升模型性能
         self.model.embed_tokens.weight = self.lm_head.weight
         self.OUT = CausalLMOutputWithPast()
 
@@ -454,8 +547,9 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
                 attention_mask: Optional[torch.Tensor] = None,
                 past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
                 use_cache: bool = False,
-                logits_to_keep: Union[int, torch.Tensor] = 0,
+                logits_to_keep: Union[int, torch.Tensor] = 0, # 如果只需要最后几个logits，可以设置这个参数，比如用于推理
                 **args):
+        # 首先调用骨干网络获取隐藏状态，kv缓存和辅助损失
         h, past_kvs, aux_loss = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -463,7 +557,14 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
             use_cache=use_cache,
             **args
         )
+        # 在训练时，计算所有位置的logits
+        # 但是在推理时，可以只计算最后几个位置的logits以节省计算资源
+        # 例如，对于生成任务，只需要最后一个位置的logits来决定下一个词
+        # 只取最后logits_to_keep个logits进行计算
+        # 如果logits_to_keep是整数，则表示取最后几个位置的logits
+        # 如果是张量，则表示取指定位置的logits
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        # 计算logits
         logits = self.lm_head(h[:, slice_indices, :])
         self.OUT.__setitem__('last_hidden_state', h)
         self.OUT.__setitem__('logits', logits)
