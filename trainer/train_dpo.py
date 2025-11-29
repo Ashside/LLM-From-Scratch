@@ -26,6 +26,10 @@ def logits_to_log_probs(logits, labels):
     # labels shape: (batch_size, seq_len)
     # log_probs shape: (batch_size, seq_len)
     log_probs = F.log_softmax(logits, dim=2)
+    # labels 是真实的token id，使用gather获取对应的log_probs
+    # 对labels在最后一维增加一个维度以匹配log_probs的维度
+    # 然后使用gather获取对应的log_probs，最后squeeze掉多余的维度
+    # 输出shape: (batch_size, seq_len)
     log_probs_per_token = torch.gather(log_probs, dim=2, index=labels.unsqueeze(2)).squeeze(-1)
     return log_probs_per_token
 
@@ -34,26 +38,36 @@ def dpo_loss(ref_log_probs, policy_log_probs, mask, beta):
     # ref_log_probs 和 policy_log_probs 都是 shape: (batch_size, seq_len)
     # https://github.com/jingyaogong/minimind/issues/298
     seq_lengths = mask.sum(dim=1, keepdim=True).clamp_min(1e-8)  # 防止零长度mask导致除零NaN
+
+    # 计算每个序列的平均log概率，注意这里是参考模型，一般不会更新
     ref_log_probs = (ref_log_probs * mask).sum(dim=1) / seq_lengths.squeeze()
+    # 计算每个序列的平均log概率，注意这里是策略模型，通常会更新
     policy_log_probs = (policy_log_probs * mask).sum(dim=1) / seq_lengths.squeeze()
 
     # 将 chosen 和 rejected 数据分开
     batch_size = ref_log_probs.shape[0]
+    # 每个batch前半部分是chosen，后半部分是rejected
     chosen_ref_log_probs = ref_log_probs[:batch_size // 2]
     reject_ref_log_probs = ref_log_probs[batch_size // 2:]
     chosen_policy_log_probs = policy_log_probs[:batch_size // 2]
     reject_policy_log_probs = policy_log_probs[batch_size // 2:]
 
+    # 计算策略模型和参考模型的log概率差异
     pi_logratios = chosen_policy_log_probs - reject_policy_log_probs
     ref_logratios = chosen_ref_log_probs - reject_ref_log_probs
+    # 根据公式计算DPO损失
     logits = pi_logratios - ref_logratios
+    # 求负对数sigmoid
     loss = -F.logsigmoid(beta * logits)
+    # 直接返回平均损失
     return loss.mean()
 
 
 def train_epoch(epoch, loader, iters, ref_model, lm_config, start_step=0, wandb=None, beta=0.1):
     start_time = time.time()
-    
+    # loader 是 DataLoader 对象
+    # 返回的数据是一个batch的字典
+    # 包括 x_chosen, y_chosen, mask_chosen, x_rejected, y_rejected, mask_rejected
     for step, batch in enumerate(loader, start=start_step + 1):
         x_chosen = batch['x_chosen'].to(args.device)
         x_rejected = batch['x_rejected'].to(args.device)
@@ -61,29 +75,40 @@ def train_epoch(epoch, loader, iters, ref_model, lm_config, start_step=0, wandb=
         y_rejected = batch['y_rejected'].to(args.device)
         mask_chosen = batch['mask_chosen'].to(args.device)
         mask_rejected = batch['mask_rejected'].to(args.device)
+
+        # 拼接chosen和rejected的数据
+        # 拼接后形状是(batch_size, seq_len)
+        # 前一半是chosen，后一半是rejected，在计算DPO loss时会用到
         x = torch.cat([x_chosen, x_rejected], dim=0)
         y = torch.cat([y_chosen, y_rejected], dim=0)
         mask = torch.cat([mask_chosen, mask_rejected], dim=0)
 
+        # 计算当前学习率
         lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
-
+        # 使用混合精度上下文
         with autocast_ctx:
+            # 计算参考模型的log概率（不计算梯度）
+            # 参考模型不更新参数
             with torch.no_grad():
                 ref_outputs = ref_model(x)
                 ref_logits = ref_outputs.logits
             ref_log_probs = logits_to_log_probs(ref_logits, y)
             
+            # 计算策略模型的log概率
+            # 需要更新参数
             outputs = model(x)
             logits = outputs.logits
             policy_log_probs = logits_to_log_probs(logits, y)
             
+            # 计算DPO损失
             loss = dpo_loss(ref_log_probs, policy_log_probs, mask, beta=beta)
+            # 梯度累积，除以累积步数
             loss = loss / args.accumulation_steps
-
+        # 使用梯度缩放器进行反向传播
         scaler.scale(loss).backward()
-
+        # 梯度累积步骤结束，执行优化器步骤
         if (step + 1) % args.accumulation_steps == 0:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)

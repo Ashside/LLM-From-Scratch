@@ -207,13 +207,16 @@ class DPODataset(Dataset):
 
         rejected_input_ids = rejected_encoding['input_ids']
         rejected_loss_mask = self._generate_loss_mask(rejected_input_ids)
+        # 转换为tensor
+        # 这里同样是自回归任务，输入是[:-1]，目标是[1:]，loss_mask也是[1:]
         x_chosen = torch.tensor(chosen_input_ids[:-1], dtype=torch.long)
         y_chosen = torch.tensor(chosen_input_ids[1:], dtype=torch.long)
         mask_chosen = torch.tensor(chosen_loss_mask[1:], dtype=torch.long)
+        # 这里同样是自回归任务，输入是[:-1]，目标是[1:]，loss_mask也是[1:]
         x_rejected = torch.tensor(rejected_input_ids[:-1], dtype=torch.long)
         y_rejected = torch.tensor(rejected_input_ids[1:], dtype=torch.long)
         mask_rejected = torch.tensor(rejected_loss_mask[1:], dtype=torch.long)
-
+        # 返回字典
         return {
             'x_chosen': x_chosen,
             'y_chosen': y_chosen,
@@ -227,15 +230,21 @@ class DPODataset(Dataset):
         loss_mask = [0] * len(input_ids)
         i = 0
         while i < len(input_ids):
+            # 找到assistant回复的起始位置
             if input_ids[i:i + len(self.bos_id)] == self.bos_id:
+                # 注意这里也要跳过开始标识符
                 start = i + len(self.bos_id)
                 end = start
                 while end < len(input_ids):
+                    # 找到回复的结束位置
                     if input_ids[end:end + len(self.eos_id)] == self.eos_id:
                         break
                     end += 1
+                    # 标记loss_mask中对应assistant回复的部分为1
+    
                 for j in range(start + 1, min(end + len(self.eos_id) + 1, self.max_length)):
                     loss_mask[j] = 1
+                # 更新i位置，继续查找下一个assistant回复
                 i = end + len(self.eos_id) if end < len(input_ids) else len(input_ids)
             else:
                 i += 1

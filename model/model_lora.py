@@ -20,6 +20,7 @@ class LoRA(nn.Module):
 
 def apply_lora(model, rank=8):
     for name, module in model.named_modules():
+        ## 如果是线性层且是方阵，则应用LoRA
         if isinstance(module, nn.Linear) and module.weight.shape[0] == module.weight.shape[1]:
             lora = LoRA(module.weight.shape[0], module.weight.shape[1], rank=rank).to(model.device)
             setattr(module, "lora", lora)
@@ -35,7 +36,9 @@ def apply_lora(model, rank=8):
 def load_lora(model, path):
     state_dict = torch.load(path, map_location=model.device)
     for name, module in model.named_modules():
+        # 载入时，匹配对应的LoRA参数
         if hasattr(module, 'lora'):
+            # replace将key中的 name.lora. 部分替换为空字符串，提取LoRA参数
             lora_state = {k.replace(f'{name}.lora.', ''): v for k, v in state_dict.items() if f'{name}.lora.' in k}
             module.lora.load_state_dict(lora_state)
 

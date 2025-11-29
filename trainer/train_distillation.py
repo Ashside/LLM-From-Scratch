@@ -22,11 +22,17 @@ warnings.filterwarnings('ignore')
 
 
 def distillation_loss(student_logits, teacher_logits, temperature=1.0, reduction='batchmean'):
+    # 训练教师模型时不能计算梯度
     with torch.no_grad():
+        # 教师模型的概率分布
+        # teacher_logits: [batch_size, seq_len, vocab_size]
+        # 注意通过 detach() 将教师模型的输出从计算图中分离，防止梯度回传到教师模型
         teacher_probs = F.softmax(teacher_logits / temperature, dim=-1).detach()
-
+    # 学生模型的log概率
     student_log_probs = F.log_softmax(student_logits / temperature, dim=-1)
-
+    # 计算KL散度
+    # KL(P_teacher || P_student)：蒸馏损失，衡量教师分布和学生分布的差距
+    # 输出是标量（如果 reduction='batchmean'），否则依 reduction 而变
     kl = F.kl_div(
         student_log_probs,
         teacher_probs,
@@ -39,9 +45,15 @@ def train_epoch(epoch, loader, iters, teacher_model, lm_config_student, start_st
     start_time = time.time()
     
     if teacher_model is not None:
+        # 改变教师模型为评估模式
+        # 评估模式下，某些层（如Dropout、BatchNorm）行为不同
+        # 比如Dropout层在训练时会随机丢弃一部分神经元，而在评估时则不丢弃
+        # 这样可以确保教师模型的输出在蒸馏过程中是一致且稳定的
         teacher_model.eval()
+        # 教师模型参数不更新
         teacher_model.requires_grad_(False)
 
+    
     for step, (X, Y, loss_mask) in enumerate(loader, start=start_step + 1):
         X = X.to(args.device)
         Y = Y.to(args.device)
@@ -53,30 +65,40 @@ def train_epoch(epoch, loader, iters, teacher_model, lm_config_student, start_st
         # 前向传播（学生模型）
         with autocast_ctx:
             res = model(X)
+            # student_logits: [batch_size, seq_len, vocab_size]
             student_logits = res.logits
 
         # 教师模型前向传播（只在eval & no_grad）
         if teacher_model is not None:
             with torch.no_grad():
+                # teacher_logits: [batch_size, seq_len, vocab_size_teacher]
                 teacher_logits = teacher_model(X).logits
                 vocab_size_student = student_logits.size(-1)
+                # 裁剪教师logits以匹配学生模型的词汇表大小
                 teacher_logits = teacher_logits[..., :vocab_size_student]
 
         # ========== 计算损失 ==========
         # 1) Ground-Truth CE Loss
         loss_mask_flat = loss_mask.view(-1)
+        # 计算交叉熵损失
+        # student_logits: [batch_size, seq_len, vocab_size] -> [batch_size*seq_len, vocab_size]
+        # Y: [batch_size, seq_len] -> [batch_size*seq_len]
         ce_loss = F.cross_entropy(
             student_logits.view(-1, student_logits.size(-1)),
             Y.view(-1),
             ignore_index=0,
             reduction='none'
         )
+        # 仅对有效位置计算损失
         ce_loss = torch.sum(ce_loss * loss_mask_flat) / loss_mask_flat.sum()
+        # 如果使用MoE，还要加上aux_loss
         if lm_config_student.use_moe:
             ce_loss += res.aux_loss
 
         # 2) Distillation Loss
+        # 仅在存在教师模型时计算蒸馏损失
         if teacher_model is not None:
+            # 计算蒸馏损失，只在有效位置计算
             distill_loss = distillation_loss(
                 student_logits.view(-1, student_logits.size(-1))[loss_mask_flat == 1],
                 teacher_logits.view(-1, teacher_logits.size(-1))[loss_mask_flat == 1],
@@ -87,9 +109,9 @@ def train_epoch(epoch, loader, iters, teacher_model, lm_config_student, start_st
 
         # 3) 总损失 = alpha * CE + (1-alpha) * Distill
         loss = (alpha * ce_loss + (1 - alpha) * distill_loss) / args.accumulation_steps
-
+        # 反向传播
         scaler.scale(loss).backward()
-
+        # 优化器步进（考虑梯度累积）
         if (step + 1) % args.accumulation_steps == 0:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
@@ -207,6 +229,7 @@ if __name__ == "__main__":
     
     # ========== 7. DDP包模型 ==========
     if dist.is_initialized():
+        # 忽略某些参数不进行DDP同步
         model._ddp_params_and_buffers_to_ignore = {"freqs_cos", "freqs_sin"}
         model = DistributedDataParallel(model, device_ids=[local_rank])
     
