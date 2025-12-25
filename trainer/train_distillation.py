@@ -172,6 +172,7 @@ if __name__ == "__main__":
     parser.add_argument('--teacher_hidden_size', default=768, type=int, help="教师模型隐藏层维度")
     parser.add_argument('--teacher_num_layers', default=16, type=int, help="教师模型隐藏层数量")
     parser.add_argument('--use_moe', default=0, type=int, choices=[0, 1], help="是否使用MoE架构（0=否，1=是）")
+    parser.add_argument('--headwise_attn_output_gate', default=1, type=int, choices=[0, 1], help="是否启用Headwise注意力输出门控（0=否，1=是）")
     parser.add_argument('--from_student_weight', default='full_sft', type=str, help="学生模型基于哪个权重")
     parser.add_argument('--from_teacher_weight', default='full_sft', type=str, help="教师模型基于哪个权重")
     parser.add_argument('--from_resume', default=0, type=int, choices=[0, 1], help="是否自动检测&续训（0=否，1=是）")
@@ -188,8 +189,18 @@ if __name__ == "__main__":
     
     # ========== 2. 配置目录、模型参数、检查ckp ==========
     os.makedirs(args.save_dir, exist_ok=True)
-    lm_config_student = MiniMindConfig(hidden_size=args.student_hidden_size, num_hidden_layers=args.student_num_layers, use_moe=bool(args.use_moe))
-    lm_config_teacher = MiniMindConfig(hidden_size=args.teacher_hidden_size, num_hidden_layers=args.teacher_num_layers, use_moe=bool(args.use_moe))
+    lm_config_student = MiniMindConfig(
+        hidden_size=args.student_hidden_size,
+        num_hidden_layers=args.student_num_layers,
+        use_moe=bool(args.use_moe),
+        headwise_attn_output_gate=bool(args.headwise_attn_output_gate),
+    )
+    lm_config_teacher = MiniMindConfig(
+        hidden_size=args.teacher_hidden_size,
+        num_hidden_layers=args.teacher_num_layers,
+        use_moe=bool(args.use_moe),
+        headwise_attn_output_gate=bool(args.headwise_attn_output_gate),
+    )
     ckp_data = lm_checkpoint(lm_config_student, weight=args.save_weight, save_dir='../checkpoints') if args.from_resume==1 else None
     
     # ========== 3. 设置混合精度 ==========
