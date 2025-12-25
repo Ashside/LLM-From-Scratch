@@ -25,6 +25,9 @@ class MiniMindConfig(PretrainedConfig):
             rope_theta: int = 1000000.0,
             inference_rope_scaling: bool = False,
             flash_attn: bool = True,
+            headwise_attn_output_gate: bool = False,
+            elementwise_attn_output_gate: bool = False,
+            qkv_bias: bool = False,
             ####################################################
             # Here are the specific configurations of MOE
             # When use_moe is false, the following is invalid
@@ -63,6 +66,14 @@ class MiniMindConfig(PretrainedConfig):
             "type": "yarn"
         } if self.inference_rope_scaling else None
         self.flash_attn = flash_attn
+        ####################################################
+        # 确定使用的gated attention机制的粒度
+        # 如果是 headwise_attn_output_gate，则每个注意力头有一个门控值
+        # 如果是 elementwise_attn_output_gate，则每个元素有一个门控值
+        ######################################################
+        self.headwise_attn_output_gate = headwise_attn_output_gate
+        self.elementwise_attn_output_gate = elementwise_attn_output_gate
+        self.qkv_bias = qkv_bias
         ####################################################
         # Here are the specific configurations of MOE
         # When use_moe is false, the following is invalid
@@ -172,16 +183,32 @@ class Attention(nn.Module):
         # 计算每个query头对应的key/value头的重复次数
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
         self.head_dim = args.hidden_size // args.num_attention_heads
+        # 设置门控机制
+        self.headwise_attn_output_gate = args.headwise_attn_output_gate
+        self.elementwise_attn_output_gate = args.elementwise_attn_output_gate
+        if self.headwise_attn_output_gate and self.elementwise_attn_output_gate:
+            raise ValueError("Only one of headwise_attn_output_gate or elementwise_attn_output_gate can be True.")
+        qkv_bias = getattr(args, "qkv_bias", False)
         # 定义线性投影层
         # 注意如果使用多头注意力机制，hidden_size通常是head_dim * num_attention_heads
         # 因此这里的q_proj会将hidden_size映射到num_attention_heads * head_dim，即保持维度不变
         # k_proj和v_proj则映射到num_key_value_heads * head_dim，可能会减少维度
-        self.q_proj = nn.Linear(args.hidden_size, args.num_attention_heads * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(args.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(args.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
+        if self.headwise_attn_output_gate:
+            # 如果是headwise门控，则q的输出维度需要多加num_attention_heads个维度用于存储门控值
+            q_proj_out_dim = args.num_attention_heads * self.head_dim + args.num_attention_heads
+        elif self.elementwise_attn_output_gate:
+            # 如果是elementwise门控，则q的输出维度需要多加num_attention_heads * head_dim个维度用于存储门控值
+            # 也就是直接将q的维度翻倍
+            q_proj_out_dim = args.num_attention_heads * self.head_dim * 2
+        else:
+            q_proj_out_dim = args.num_attention_heads * self.head_dim
+
+        self.q_proj = nn.Linear(args.hidden_size, q_proj_out_dim, bias=qkv_bias)
+        self.k_proj = nn.Linear(args.hidden_size, self.num_key_value_heads * self.head_dim, bias=qkv_bias)
+        self.v_proj = nn.Linear(args.hidden_size, self.num_key_value_heads * self.head_dim, bias=qkv_bias)
         # 输出投影层
         # 将多头注意力的输出重新映射回hidden_size维度
-        self.o_proj = nn.Linear(args.num_attention_heads * self.head_dim, args.hidden_size, bias=False)
+        self.o_proj = nn.Linear(args.num_attention_heads * self.head_dim, args.hidden_size, bias=qkv_bias)
         # dropout层
         # attn_dropout用于注意力权重的dropout
         # resid_dropout用于输出的dropout
@@ -201,7 +228,41 @@ class Attention(nn.Module):
         # 投影到q、k、v
         xq, xk, xv = self.q_proj(x), self.k_proj(x), self.v_proj(x)
         # 重塑形状以适应多头注意力机制
-        xq = xq.view(bsz, seq_len, self.n_local_heads, self.head_dim)
+        if self.headwise_attn_output_gate:
+            # 如果是headwise门控
+            # 首先将xq的形状调整为 
+            # (bsz, seq_len, n_local_kv_heads, head_dim * n_rep + n_rep)
+            xq = xq.view(bsz, seq_len, self.n_local_kv_heads, -1)
+            # 将xq拆分为实际的query部分和门控分数部分
+            xq, gate_score = torch.split(
+                xq, [self.head_dim * self.n_rep, self.n_rep], dim=-1
+            )
+            # gate_score是门控分数，用于调节每个注意力头的输出
+            # 这里将gate_score的形状调整为 (bsz, seq_len, n_heads, 1)
+            gate_score = gate_score.reshape(bsz, seq_len, -1, 1)  # (bsz, seq_len, n_heads, 1)
+            # 将xq调整为标准的多头注意力形状
+            # 形状为 (bsz, seq_len, n_heads, head_dim)
+            xq = xq.reshape(bsz, seq_len, -1, self.head_dim)
+        elif self.elementwise_attn_output_gate:
+            # 同理，如果是elementwise门控
+            # 首先将xq的形状调整为 
+            # (bsz, seq_len, n_local_kv_heads, head_dim * n_rep * 2)
+            xq = xq.view(bsz, seq_len, self.n_local_kv_heads, -1)
+            # 将xq拆分为实际的query部分和门控分数部分
+            # 这里的门控分数是针对每个元素的
+            # 所以需要 head_dim乘以n_rep
+            xq, gate_score = torch.split(
+                xq, [self.head_dim * self.n_rep, self.head_dim * self.n_rep], dim=-1
+            )
+            # gate_score是门控分数，用于调节每个元素的输出
+            # 这里将gate_score的形状调整为 (bsz, seq_len, n_heads, head_dim)
+            gate_score = gate_score.reshape(bsz, seq_len, -1, self.head_dim)  # (bsz, seq_len, n_heads, head_dim)
+            # 
+            xq = xq.reshape(bsz, seq_len, -1, self.head_dim)
+        else:
+            gate_score = None
+            xq = xq.view(bsz, seq_len, self.n_local_heads, self.head_dim)
+
         xk = xk.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
 
@@ -260,7 +321,11 @@ class Attention(nn.Module):
             output = scores @ xv
 
         # 重新调整输出形状
-        output = output.transpose(1, 2).reshape(bsz, seq_len, -1)
+        output = output.transpose(1, 2)
+        if gate_score is not None:
+            # 应用门控机制
+            output = output * torch.sigmoid(gate_score)
+        output = output.reshape(bsz, seq_len, -1)
         output = self.resid_dropout(self.o_proj(output))
         # 返回输出和更新后的past_key_value
         return output, past_kv

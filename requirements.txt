@@ -2,6 +2,7 @@ datasets==3.6.0
 datasketch==1.6.4
 Flask==3.0.3
 Flask_Cors==4.0.0
+huggingface_hub==0.26.1
 jieba==0.42.1
 jsonlines==4.0.0
 marshmallow==3.22.0

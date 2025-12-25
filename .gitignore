@@ -13,3 +13,4 @@ env/
 .venv/
 # Large dataset files
 *.jsonl
+.env

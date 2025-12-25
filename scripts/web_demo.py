@@ -99,11 +99,13 @@ def process_assistant_content(content):
 def load_model_tokenizer(model_path):
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
-        trust_remote_code=True
+        trust_remote_code=True,
+        local_files_only=True,
     )
     tokenizer = AutoTokenizer.from_pretrained(
         model_path,
-        trust_remote_code=True
+        trust_remote_code=True,
+        local_files_only=True,
     )
     model = model.eval().to(device)
     return model, tokenizer
