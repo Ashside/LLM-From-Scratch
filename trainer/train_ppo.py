@@ -25,6 +25,24 @@ from trainer.trainer_utils import Logger, is_main_process, lm_checkpoint, init_d
 warnings.filterwarnings('ignore')
 
 
+"""MiniMind PPO 训练脚本（RLAIF/RLHF 变体）
+
+本文件实现了一个“最小可跑”的 PPO 版本，用 Reward Model 给生成结果打分，
+并用一个 Critic（value head）拟合奖励来构造 advantage。
+
+实现要点（和经典 PPO 的差异/简化）：
+- 这里的 advantage 是序列级别：A = R - V(s)，没有做 GAE、没有逐 token 的奖励分解。
+- PPO 的 ratio 也是序列级别：ratio = exp(logπ_new(y|x) - logπ_old(y|x))。
+- 额外引入 Reference 模型（ref_model）做 KL 正则，约束策略不要跑太远（避免奖励黑客/崩坏）。
+- 训练一次只采样 1 条 response（每个 prompt），没有 rollout buffer / 多轮优化等工程化细节。
+
+你可以把它理解为：
+1) 用 actor 采样 response；2) reward_model 打分得到 R；
+3) critic 预测 V；4) 用 PPO clip objective 更新 actor；
+5) 用 MSE 更新 critic；6) 用 ref KL 做额外约束。
+"""
+
+
 # 自定义的Critic模型，继承自MiniMindLM
 class CriticModel(MiniMindForCausalLM):
     def __init__(self, params):
@@ -121,56 +139,99 @@ def ppo_train_epoch(epoch, loader, iters, old_actor_model, ref_model, actor_sche
     critic_model.train()
 
     for step, batch in enumerate(loader, start=start_step + 1):
-        prompts = batch["prompt"]  # list[str], length B
-        enc = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, 
-                       max_length=args.max_seq_len).to(args.device)  # input_ids: [B, P], attention_mask: [B, P]
-        prompt_lengths = torch.full((enc.input_ids.size(0),), enc.input_ids.shape[1], dtype=torch.long, device=enc.input_ids.device)  # [B]
+        # ====== (1) 取 prompt，并做 tokenizer 编码 ======
+        # prompts: list[str], length = B
+        prompts = batch["prompt"]
+        # 这里的 enc.input_ids / attention_mask 都是 [B, P]
+        # 注意：PPO 这里把 prompt pad 到同一长度（args.max_seq_len），后面会用 prompt_lengths 生成 response mask。
+        enc = tokenizer(
+            prompts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=args.max_seq_len,
+        ).to(args.device)
+        # 由于 prompt 被 padding 到同一长度，prompt_lengths 这里等于 enc 的宽度。
+        # 如果你未来想做“每条 prompt 原始长度不同”的精确 mask，需要用 attention_mask.sum(-1) 来得到真实长度。
+        prompt_lengths = torch.full(
+            (enc.input_ids.size(0),),
+            enc.input_ids.shape[1],
+            dtype=torch.long,
+            device=enc.input_ids.device,
+        )  # [B]
 
         with torch.no_grad():
             # DDP 模型需要使用 .module 访问 generate 方法
             model_for_gen = actor_model.module if isinstance(actor_model, DistributedDataParallel) else actor_model
+            # ====== (2) 用 actor 采样生成 response ======
+            # gen_out: [B, P+R]，其中 P=prompt 长度，R<=max_new_tokens
             gen_out = model_for_gen.generate(
                 input_ids=enc.input_ids, attention_mask=enc.attention_mask,
                 max_new_tokens=args.max_gen_len, do_sample=True, temperature=0.8,
                 pad_token_id=tokenizer.pad_token_id, eos_token_id=tokenizer.eos_token_id)  # [B, P+R]
 
+        # ====== (3) 解码得到文本 response，并计算奖励 R ======
+        # responses_text: list[str], length=B
         responses_text = [tokenizer.decode(gen_out[i, prompt_lengths[i]:], skip_special_tokens=True) for i in range(len(prompts))]
         rewards = calculate_rewards(prompts, responses_text, reward_model, reward_tokenizer)  # [B]
 
-        full_mask = (gen_out != tokenizer.pad_token_id).long()  # [B, P+R]
+        # ====== (4) 构造 attention_mask，并计算 Critic 的 value 估计 V ======
+        # full_mask: [B, P+R]，用于让模型忽略 pad。
+        full_mask = (gen_out != tokenizer.pad_token_id).long()
+        # critic_model 输出每个位置的 value: values_seq [B, P+R]
         values_seq = critic_model(input_ids=gen_out, attention_mask=full_mask)  # [B, P+R]
+        # 我们取“序列最后一个非 pad token”位置的 value 作为整个 response 的 V(s)
         last_indices = full_mask.sum(dim=1) - 1  # [B]
         values = values_seq[torch.arange(values_seq.size(0), device=values_seq.device), last_indices]  # [B]
+        # advantage：这里是最简化形式 A = R - V
+        # detach value，避免 policy loss 反传进 critic
         advantages = rewards - values.detach()  # [B]
 
-        logits = actor_model(input_ids=gen_out, attention_mask=full_mask).logits  # [B, P+R, V]
+        # ====== (5) 计算 actor 对整段序列的 log π(y|x)（只统计 response token）======
+        # logits: [B, P+R, vocab]
+        logits = actor_model(input_ids=gen_out, attention_mask=full_mask).logits
+        # labels 是 next-token 预测的目标：对齐 logits[:, :-1] -> labels
         labels = gen_out[:, 1:].clone()  # [B, P+R-1]
         logp_tokens = F.log_softmax(logits[:, :-1], dim=-1).gather(2, labels.unsqueeze(-1)).squeeze(-1)  # [B, P+R-1]
         seq_len = gen_out.size(1) - 1
+        # resp_mask: [B, P+R-1]，标记哪些位置属于 response（从 prompt 末尾开始）
         resp_mask = torch.arange(seq_len, device=gen_out.device).unsqueeze(0) >= prompt_lengths.unsqueeze(1)
+        # final_mask: 仅对 response 且非 pad 的 token 计入 logprob
         final_mask = resp_mask & (~labels.eq(tokenizer.pad_token_id))  # [B, P+R-1]
+        # actor_logp: [B]，序列级 logprob（把 response 部分 token 的 logp 求和）
         actor_logp = (logp_tokens * final_mask).sum(dim=1)  # [B]
 
         with torch.no_grad():
+            # old_actor_model 提供行为策略（采样时刻的策略）的 logprob，用于 PPO ratio。
             old_logits = old_actor_model(input_ids=gen_out, attention_mask=full_mask).logits  # [B, P+R, V]
             old_logp_tokens = F.log_softmax(old_logits[:, :-1], dim=-1).gather(2, labels.unsqueeze(-1)).squeeze(-1)  # [B, P+R-1]
             old_logp = (old_logp_tokens * final_mask).sum(dim=1)  # [B]
             
+            # ref_model 用于 KL 正则（把当前策略拉回到一个“安全的/初始的”参考分布附近）
             ref_logits = ref_model(input_ids=gen_out, attention_mask=full_mask).logits  # [B, P+R, V]
             ref_logp_tokens = F.log_softmax(ref_logits[:, :-1], dim=-1).gather(2, labels.unsqueeze(-1)).squeeze(-1)  # [B, P+R-1]
             ref_logp = (ref_logp_tokens * final_mask).sum(dim=1)  # [B]
 
-        kl = (actor_logp - old_logp).mean()  # scalar
-        kl_ref = (actor_logp - ref_logp).mean()  # scalar
+        # ====== (6) PPO 目标：clip + KL(ref) 正则 ======
+        # 这里的 kl / kl_ref 都是“序列级的 logprob 差的均值”。
+        # 严格意义上的 KL 需要对分布求期望；这里用 logprob 差做近似/监控指标。
+        kl = (actor_logp - old_logp).mean()  # scalar，用于监控 new vs old 的漂移
+        kl_ref = (actor_logp - ref_logp).mean()  # scalar，用于 ref 正则项
         ratio = torch.exp(actor_logp - old_logp)  # [B]
+        # PPO clipped surrogate objective:
+        #   L = E[min(ratio*A, clip(ratio,1-ε,1+ε)*A)]
         surr1 = ratio * advantages  # [B]
         surr2 = torch.clamp(ratio, 1.0 - args.clip_epsilon, 1.0 + args.clip_epsilon) * advantages  # [B]
         policy_loss = -torch.min(surr1, surr2).mean()  # scalar
+        # critic 用 MSE 逼近 reward（这里 reward 是序列级 scalar）
         value_loss = F.mse_loss(values, rewards)  # scalar
+        # 总 loss：policy + vf + KL(ref)
+        # 注意：这里没有 entropy bonus，如果训练不稳定可考虑加（但本文件目前不实现）。
         loss = policy_loss + args.vf_coef * value_loss + args.kl_coef * kl_ref  # scalar
         loss.backward()
 
         if (step + 1) % args.accumulation_steps == 0:
+            # 同时裁剪 actor / critic 的梯度，避免梯度爆炸
             clip_grad_norm_(actor_model.parameters(), args.grad_clip)
             clip_grad_norm_(critic_model.parameters(), args.grad_clip)
             actor_optimizer.step()
@@ -182,6 +243,7 @@ def ppo_train_epoch(epoch, loader, iters, old_actor_model, ref_model, actor_sche
             torch.cuda.empty_cache()
 
         if is_main_process():
+            # ====== (7) 统计生成长度、日志与可视化 ======
             response_ids = gen_out[:, enc.input_ids.shape[1]:]
             is_eos = (response_ids == tokenizer.eos_token_id)
             eos_indices = torch.argmax(is_eos.int(), dim=1)
@@ -215,11 +277,14 @@ def ppo_train_epoch(epoch, loader, iters, old_actor_model, ref_model, actor_sche
                    f"Avg Response Len: {avg_len_val:.2f}, Actor LR: {actor_lr:.2e}, Critic LR: {critic_lr:.2e}")
 
         if (step + 1) % args.update_old_actor_freq == 0:
+            # ====== (8) 同步 old_actor_model（行为策略）======
+            # PPO 需要一个“固定的旧策略”来计算 ratio；这里用固定频率把 old_actor 更新为当前 actor。
             state_dict = actor_model.module.state_dict() if isinstance(actor_model, DistributedDataParallel) else actor_model.state_dict()
             old_actor_model.load_state_dict({k: v.detach().cpu() for k, v in state_dict.items()})
             old_actor_model.to(args.device)
 
         if (step % args.save_interval == 0 or step == iters - 1) and is_main_process():
+            # ====== (9) 保存权重与断点恢复状态 ======
             actor_model.eval()
             moe_suffix = '_moe' if lm_config.use_moe else ''
             ckp = f'{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth'

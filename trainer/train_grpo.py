@@ -24,6 +24,26 @@ from trainer.trainer_utils import Logger, is_main_process, lm_checkpoint, init_d
 warnings.filterwarnings('ignore')
 
 
+"""MiniMind GRPO 训练脚本（Group Relative Policy Optimization / RLAIF 变体）
+
+该实现更接近“无 Critic / 无 value 网络”的策略梯度做法：
+- 对每个 prompt 采样多条 response（args.num_generations）。
+- 用 Reward Model 给每条 response 打分得到 reward。
+- 在同一 prompt 的组内做标准化：A = (R - mean(R_group)) / (std(R_group)+eps)，
+    这相当于用组内相对排序/相对优势来减小方差，避免必须训练 critic。
+
+与 PPO 的核心差异：
+- PPO 通常需要 old policy 计算 ratio，并配合 clip 约束更新幅度；
+- GRPO 这里没有 old policy，而是使用一种“前向恒等、反向有梯度”的技巧：
+        exp(logp - logp.detach())
+    这个量在前向恒等于 1，但对 logp 的梯度不为 0，从而实现 REINFORCE 风格的
+    `-A * logp` 梯度（写成指数形式更易与其他实现统一）。
+
+此外，脚本还用 ref_model 做 token-level 的 KL 惩罚项（args.beta），
+把策略约束在参考模型附近，降低奖励模型被“投机”的风险。
+"""
+
+
 def calculate_rewards(prompts, responses, reward_model, reward_tokenizer):
     """整合所有奖励函数计算总奖励"""
     def reasoning_model_reward(rewards):
@@ -94,23 +114,40 @@ def calculate_rewards(prompts, responses, reward_model, reward_tokenizer):
 
 def grpo_train_epoch(epoch, loader, iters, ref_model, reward_model, reward_tokenizer, start_step=0, wandb=None):
     for step, batch in enumerate(loader, start=start_step + 1):
-        prompts = batch['prompt']  # list[str], length B
-        prompt_inputs = tokenizer(prompts, return_tensors="pt", padding=True, return_token_type_ids=False,
-                                  padding_side="left", add_special_tokens=False).to(args.device)  # input_ids: [B, P], attention_mask: [B, P]
+        # ====== (1) 取 prompt 并编码（左 padding，便于 generate）======
+        # prompts: list[str], length=B
+        prompts = batch['prompt']
+        # prompt_inputs.input_ids / attention_mask: [B, P]
+        # padding_side="left"：保证不同长度 prompt 对齐在右侧，生成时更自然
+        prompt_inputs = tokenizer(
+            prompts,
+            return_tensors="pt",
+            padding=True,
+            return_token_type_ids=False,
+            padding_side="left",
+            add_special_tokens=False,
+        ).to(args.device)
         if args.max_seq_len:
+            # 仅保留 prompt 最后 max_seq_len 个 token（防止 prompt 太长影响上下文预算）
             prompt_inputs["input_ids"] = prompt_inputs["input_ids"][:, -args.max_seq_len:]
             prompt_inputs["attention_mask"] = prompt_inputs["attention_mask"][:, -args.max_seq_len:]
 
         with torch.no_grad():
             # DDP 模型需要使用 .module 访问 generate 方法
             model_for_gen = model.module if isinstance(model, DistributedDataParallel) else model
+            # ====== (2) 采样生成：每个 prompt 生成 num_generations 条 response ======
+            # outputs: [B*num_gen, P+R]
             outputs = model_for_gen.generate(
                 **prompt_inputs, max_new_tokens=args.max_gen_len, do_sample=True, temperature=0.8,
                 num_return_sequences=args.num_generations, pad_token_id=tokenizer.pad_token_id)  # [B*num_gen, P+R]
 
+        # completion_ids: [B*num_gen, R]（只取 prompt 之后的新生成部分）
         completion_ids = outputs[:, prompt_inputs["input_ids"].size(1):]  # [B*num_gen, R]
         
         def get_per_token_logps(mdl, input_ids, n_keep):
+            # 计算“最后 n_keep 个 token”的 per-token log probability。
+            # 这里传入的 input_ids 是整段 [prompt + completion]，
+            # 但我们只关心 completion 段的 token logp。
             input_ids = input_ids.detach().clone() if input_ids.is_inference() else input_ids
             logits = mdl(input_ids, logits_to_keep=n_keep + 1).logits[:, :-1, :]
             per_token_logps = []
@@ -119,27 +156,53 @@ def grpo_train_epoch(epoch, loader, iters, ref_model, reward_model, reward_token
                 per_token_logps.append(torch.gather(logits_row.log_softmax(dim=-1), 1, ids_row.unsqueeze(1)).squeeze(1))
             return torch.stack(per_token_logps)
 
+        # per_token_logps: [B*num_gen, R]
         per_token_logps = get_per_token_logps(model, outputs, completion_ids.size(1))  # [B*num_gen, R]
         with torch.no_grad():
+            # ref_per_token_logps: [B*num_gen, R]
             ref_per_token_logps = get_per_token_logps(ref_model, outputs, completion_ids.size(1))  # [B*num_gen, R]
 
+        # ====== (3) Reward：对每条 completion 打分，得到 [B*num_gen] 的 reward ======
         completions = tokenizer.batch_decode(completion_ids, skip_special_tokens=True)
         rewards = calculate_rewards(prompts, completions, reward_model, reward_tokenizer).to(args.device)  # [B*num_gen]
 
+        # ====== (4) 组内标准化 advantage（核心：group relative）======
+        # grouped_rewards: [B, num_gen]
         grouped_rewards = rewards.view(-1, args.num_generations)  # [B, num_gen]
+        # mean_r/std_r 会 repeat_interleave 回 [B*num_gen]
         mean_r = grouped_rewards.mean(dim=1).repeat_interleave(args.num_generations)  # [B*num_gen]
         std_r = grouped_rewards.std(dim=1).repeat_interleave(args.num_generations)  # [B*num_gen]
+        # advantages: [B*num_gen]
+        # 先做组内标准化，再做全局标准化（进一步稳定训练；同时 clamp 避免极端值）
         advantages = torch.clamp((rewards - mean_r) / (std_r + 1e-4), -10, 10)
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)  # [B*num_gen]
 
+        # ====== (5) completion_mask：只对 EOS 之前的 token 计入 loss ======
+        # is_eos: [B*num_gen, R]
         is_eos = completion_ids == tokenizer.eos_token_id  # [B*num_gen, R]
         eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=args.device)
         eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
+        # completion_mask: [B*num_gen, R]，EOS 位置及之前为 1，之后为 0
         completion_mask = (torch.arange(is_eos.size(1), device=args.device).expand(is_eos.size(0), -1) <= eos_idx.unsqueeze(1)).int()  # [B*num_gen, R]
 
+        # ====== (6) Loss：策略梯度项 + KL(ref) 惩罚项 ======
+        # 这里的 KL 采用常见的“non-negative KL proxy”：
+        #   KL(p||q) >= exp(log q - log p) - (log q - log p) - 1
+        # 其中 p=当前策略，q=参考策略。
         kl_div = ref_per_token_logps - per_token_logps
         per_token_kl = torch.exp(kl_div) - kl_div - 1  # [B*num_gen, R]
-        per_token_loss = -(torch.exp(per_token_logps - per_token_logps.detach()) * advantages.unsqueeze(1) - args.beta * per_token_kl)  # [B*num_gen, R]
+
+        # policy gradient 项：
+        #   经典写法是 -A * logp
+        # 这里写成 -exp(logp - logp.detach()) * A：
+        #   - 前向：exp(logp - logp_detach) == 1（数值上不改变 loss）
+        #   - 反向：对 logp 有梯度，相当于实现 -A * d(logp)
+        # 优点是可以无缝和“ratio-based”实现风格对齐；缺点是读起来不直观，所以这里加注释。
+        per_token_loss = -(
+            torch.exp(per_token_logps - per_token_logps.detach()) * advantages.unsqueeze(1)
+            - args.beta * per_token_kl
+        )  # [B*num_gen, R]
+        # 对 token 做 mask 后，先按序列平均，再对 batch 求平均；再除 accumulation_steps 做梯度累积
         loss = ((per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean() / args.accumulation_steps  # scalar
         loss.backward()
 
@@ -152,6 +215,7 @@ def grpo_train_epoch(epoch, loader, iters, ref_model, reward_model, reward_token
             torch.cuda.empty_cache()
 
         if step % args.log_interval == 0 or step == iters:
+            # ====== (7) 日志：loss / reward / 生成长度 / lr ======
             policy_loss_val = loss.item()
             avg_reward_val = rewards.mean().item()
             avg_len_val = completion_mask.sum(dim=1).float().mean().item()
@@ -171,6 +235,7 @@ def grpo_train_epoch(epoch, loader, iters, ref_model, reward_model, reward_token
                 })
 
         if (step % args.save_interval == 0 or step == iters - 1) and is_main_process():
+            # ====== (8) 保存权重与断点恢复状态 ======
             model.eval()
             moe_suffix = '_moe' if lm_config.use_moe else ''
             ckp = f'{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
